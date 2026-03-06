@@ -33,18 +33,18 @@ struct Inner<T> {
 }
 ```
 
-## Borrow Rules
+## Borrow Semantics
 
 Unlike `RefCell` which supports multiple immutable borrows OR one mutable borrow, `ThinCell` only supports **one mutable borrow at a time**. Attempting to borrow while already borrowed will:
 
-- `sync::ThinCell<T>`: Thread-safe, uses `AtomicUsize` and blocking borrow semantics: borrowing while already borrowed will busy loop and `yield_now`.
-- `unsync::ThinCell<T>`: Single threaded, uses `Cell<usize>` and panicking borrow semantics: borrowing while already borrowed will panic.
+- `sync::ThinCell<T>`: Block current thread by busy-looping and yield to other threads;
+- `unsync::ThinCell<T>`: Panic immediately.
 
 `try_borrow` is available for both versions, which returns `None` instead of panicking or blocking when already borrowed.
 
-# Examples
+## Examples
 
-## Basic Usage
+### Basic Usage
 
 ```rust
 # use thin_cell::unsync::ThinCell;
@@ -63,7 +63,7 @@ let cell2 = cell.clone();
 assert_eq!(*cell2.borrow(), 100);
 ```
 
-## With Trait Objects (Unsized Types)
+### With Trait Objects (Unsized Types)
 
 Due to limitation of stable rust, or in particular, the lack of [`CoerceUnsized`](https://doc.rust-lang.org/std/ops/trait.CoerceUnsized.html), creating a `ThinCell<dyn Trait>` from a concrete type requires manual [`coercion`](https://doc.rust-lang.org/reference/type-coercions.html#unsized-coercions), and that coercion's safety has to be guaranteed by the user. Normally just `ptr as *const Inner<MyUnsizedType>` or `ptr as _` with external type annotation is good enough:
 
@@ -89,7 +89,7 @@ let cell: ThinCell<dyn Animal> = unsafe { ThinCell::new_unsize(Dog, |p| p as _) 
 assert_eq!(std::mem::size_of_val(&cell), std::mem::size_of::<usize>());
 ```
 
-## Borrow Checking
+### Borrow Checking
 
 ```rust,should_panic
 use thin_cell::unsync::ThinCell;
