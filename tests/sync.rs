@@ -2006,3 +2006,344 @@ fn test_unsize_operations_concurrent() {
     assert_eq!(handle1.join().unwrap(), 1);
     assert_eq!(handle2.join().unwrap(), 5);
 }
+
+#[cfg(feature = "weak")]
+mod weak_tests {
+    use super::*;
+
+    #[test]
+    fn test_weak_basic() {
+        let cell = ThinCell::new(42);
+        let weak = cell.downgrade();
+
+        assert_eq!(cell.strong_count(), 1);
+        assert_eq!(cell.weak_count(), 2);
+
+        let upgraded = weak.upgrade().unwrap();
+        assert_eq!(*upgraded.borrow(), 42);
+        assert_eq!(cell.strong_count(), 2);
+    }
+
+    #[test]
+    fn test_weak_upgrade_after_drop() {
+        let cell = ThinCell::new(42);
+        let weak = cell.downgrade();
+
+        assert!(weak.upgrade().is_some());
+        drop(cell);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn test_weak_clone() {
+        let cell = ThinCell::new(42);
+        let weak1 = cell.downgrade();
+        let weak2 = weak1.clone();
+
+        assert_eq!(cell.weak_count(), 3);
+        assert_eq!(weak1.weak_count(), 3);
+        assert_eq!(weak2.weak_count(), 3);
+    }
+
+    #[test]
+    fn test_weak_multiple() {
+        let cell = ThinCell::new(42);
+        let weak1 = cell.downgrade();
+        let weak2 = cell.downgrade();
+        let weak3 = cell.downgrade();
+
+        assert_eq!(cell.strong_count(), 1);
+        assert_eq!(cell.weak_count(), 4);
+
+        drop(weak1);
+        assert_eq!(cell.weak_count(), 3);
+
+        drop(weak2);
+        assert_eq!(cell.weak_count(), 2);
+
+        drop(weak3);
+        assert_eq!(cell.weak_count(), 1);
+    }
+
+    #[test]
+    fn test_weak_strong_interleaved() {
+        let cell1 = ThinCell::new(100);
+        let weak1 = cell1.downgrade();
+
+        let cell2 = cell1.clone();
+        let _weak2 = cell2.downgrade();
+
+        assert_eq!(cell1.strong_count(), 2);
+        assert_eq!(cell1.weak_count(), 3);
+
+        drop(cell1);
+        assert_eq!(cell2.strong_count(), 1);
+        assert_eq!(cell2.weak_count(), 3);
+
+        let upgraded = weak1.upgrade().unwrap();
+        assert_eq!(*upgraded.borrow(), 100);
+    }
+
+    #[test]
+    fn test_weak_outlives_strong() {
+        let weak = {
+            let cell = ThinCell::new(String::from("hello"));
+            cell.downgrade()
+        };
+
+        assert!(weak.upgrade().is_none());
+        assert_eq!(weak.strong_count(), 0);
+    }
+
+    #[test]
+    fn test_weak_concurrent_upgrade() {
+        let cell = ThinCell::new(42);
+        let weak1 = cell.downgrade();
+        let weak2 = weak1.clone();
+
+        let handle1 = thread::spawn(move || weak1.upgrade().map(|c| *c.borrow()));
+        let handle2 = thread::spawn(move || weak2.upgrade().map(|c| *c.borrow()));
+
+        let result1 = handle1.join().unwrap();
+        let result2 = handle2.join().unwrap();
+
+        assert_eq!(result1, Some(42));
+        assert_eq!(result2, Some(42));
+    }
+
+    #[test]
+    fn test_weak_concurrent_drop() {
+        let cell = ThinCell::new(42);
+        let weak1 = cell.downgrade();
+        let weak2 = weak1.clone();
+        let weak3 = weak1.clone();
+
+        let handle1 = thread::spawn(move || {
+            drop(weak1);
+        });
+
+        let handle2 = thread::spawn(move || {
+            drop(weak2);
+        });
+
+        let handle3 = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            drop(weak3);
+        });
+
+        handle1.join().unwrap();
+        handle2.join().unwrap();
+        handle3.join().unwrap();
+
+        assert_eq!(cell.weak_count(), 1);
+    }
+
+    #[test]
+    fn test_weak_upgrade_race() {
+        for _ in 0..100 {
+            let cell = ThinCell::new(42);
+            let weak = cell.downgrade();
+
+            let handle = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(1));
+                drop(cell);
+            });
+
+            thread::sleep(Duration::from_millis(1));
+            let _ = weak.upgrade();
+
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_weak_counts_accurate() {
+        let cell = ThinCell::new(42);
+
+        assert_eq!(cell.strong_count(), 1);
+        assert_eq!(cell.weak_count(), 1);
+
+        let weak1 = cell.downgrade();
+        assert_eq!(cell.strong_count(), 1);
+        assert_eq!(cell.weak_count(), 2);
+
+        let cell2 = cell.clone();
+        assert_eq!(cell.strong_count(), 2);
+        assert_eq!(cell.weak_count(), 2);
+
+        let _weak2 = cell2.downgrade();
+        assert_eq!(cell.strong_count(), 2);
+        assert_eq!(cell.weak_count(), 3);
+
+        drop(cell2);
+        assert_eq!(cell.strong_count(), 1);
+        assert_eq!(cell.weak_count(), 3);
+
+        drop(weak1);
+        assert_eq!(cell.strong_count(), 1);
+        assert_eq!(cell.weak_count(), 2);
+    }
+
+    #[test]
+    fn test_try_unwrap_with_weak_refs() {
+        let cell = ThinCell::new(String::from("hello"));
+        let weak1 = cell.downgrade();
+        let weak2 = weak1.clone();
+
+        let value = cell.try_unwrap().unwrap();
+        assert_eq!(value, "hello");
+
+        assert!(weak1.upgrade().is_none());
+        assert!(weak2.upgrade().is_none());
+        assert_eq!(weak1.strong_count(), 0);
+        assert_eq!(weak1.weak_count(), 2);
+    }
+
+    #[test]
+    fn test_weak_memory_cleanup() {
+        static DROP_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+        struct DropTracker;
+        impl Drop for DropTracker {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let weak = {
+            let cell = ThinCell::new(DropTracker);
+            let weak = cell.downgrade();
+            drop(cell);
+            weak
+        };
+
+        assert_eq!(DROP_COUNT.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(weak);
+        // Memory should be fully cleaned up now
+    }
+
+    #[test]
+    fn test_weak_cross_thread_upgrade() {
+        let cell = ThinCell::new(vec![1, 2, 3, 4, 5]);
+        let weak = cell.downgrade();
+
+        let handle = thread::spawn(move || {
+            let upgraded = weak.upgrade().unwrap();
+            upgraded.borrow().len()
+        });
+
+        let len = handle.join().unwrap();
+        assert_eq!(len, 5);
+    }
+
+    #[test]
+    fn test_weak_multiple_threads_upgrade() {
+        let cell = ThinCell::new(100);
+        let weak = cell.downgrade();
+
+        let mut handles = vec![];
+        for _ in 0..3 {
+            let w = weak.clone();
+            let handle = thread::spawn(move || {
+                if let Some(c) = w.upgrade() {
+                    *c.borrow()
+                } else {
+                    0
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), 100);
+        }
+    }
+
+    #[test]
+    fn test_weak_drop_strong_while_weak_exists() {
+        let cell = ThinCell::new(String::from("test"));
+        let weak1 = cell.downgrade();
+        let weak2 = cell.downgrade();
+
+        assert_eq!(cell.weak_count(), 3);
+        drop(cell);
+
+        assert!(weak1.upgrade().is_none());
+        assert!(weak2.upgrade().is_none());
+        assert_eq!(weak1.strong_count(), 0);
+    }
+
+    #[test]
+    fn test_weak_as_ptr() {
+        let cell = ThinCell::new(42);
+        let weak = cell.downgrade();
+
+        let ptr1 = cell.leak();
+        let ptr2 = weak.as_ptr();
+
+        assert_eq!(ptr1 as *const (), ptr2);
+
+        unsafe {
+            let _: ThinCell<i32> = ThinCell::from_raw(ptr1);
+        }
+    }
+
+    #[test]
+    fn test_weak_concurrent_upgrade_and_drop() {
+        let barrier = Arc::new(Barrier::new(3));
+        let cell = ThinCell::new(42);
+        let weak1 = cell.downgrade();
+        let weak2 = weak1.clone();
+
+        let b1 = barrier.clone();
+        let handle1 = thread::spawn(move || {
+            b1.wait();
+            drop(cell);
+        });
+
+        let b2 = barrier.clone();
+        let handle2 = thread::spawn(move || {
+            b2.wait();
+            weak1.upgrade()
+        });
+
+        let b3 = barrier.clone();
+        let handle3 = thread::spawn(move || {
+            b3.wait();
+            weak2.upgrade()
+        });
+
+        handle1.join().unwrap();
+        let _ = handle2.join().unwrap();
+        let _ = handle3.join().unwrap();
+    }
+
+    #[test]
+    fn test_weak_stress() {
+        let cell = ThinCell::new(0);
+        let mut weaks = vec![];
+
+        for _ in 0..10 {
+            weaks.push(cell.downgrade());
+        }
+
+        let mut handles = vec![];
+        for weak in weaks {
+            let handle = thread::spawn(move || {
+                for _ in 0..100 {
+                    if let Some(c) = weak.upgrade() {
+                        let mut guard = c.borrow();
+                        *guard += 1;
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert!(*cell.borrow() > 0);
+    }
+}

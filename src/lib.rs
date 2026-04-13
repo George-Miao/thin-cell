@@ -1,3 +1,4 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
@@ -49,6 +50,21 @@ macro_rules! thin_cell {
             state: &'a State,
         }
 
+        /// A weak reference to a [`ThinCell`] that doesn't prevent dropping.
+        ///
+        /// `Weak` references don't keep the value alive. The value will be dropped
+        /// when all strong references (`ThinCell`) are dropped, even if weak
+        /// references still exist.
+        ///
+        /// Use [`Weak::upgrade`] to attempt to convert a weak reference back to a
+        /// strong reference (`ThinCell`). This will fail if the value has already
+        /// been dropped.
+        #[cfg(feature = "weak")]
+        pub struct Weak<T: ?Sized> {
+            ptr: NonNull<()>,
+            _marker: PhantomData<Inner<T>>,
+        }
+
         impl<T> ThinCell<T> {
             /// Creates a new `ThinCell` wrapping the given data.
             pub fn new(data: T) -> Self {
@@ -84,12 +100,34 @@ macro_rules! thin_cell {
             /// # Safety
             /// The caller must guarantee that there are no other owners and it is not
             /// currently borrowed.
+            #[cfg(not(feature = "weak"))]
             pub unsafe fn unwrap_unchecked(self) -> T {
                 let this = ManuallyDrop::new(self);
                 // SAFETY: guaranteed by caller to have unique ownership and is not borrowed
                 let inner = unsafe { Box::from_raw(this.inner_ptr() as *mut Inner<T>) };
 
                 inner.data.into_inner()
+            }
+
+            /// Consumes the `ThinCell`, returning the inner value.
+            ///
+            /// # Safety
+            /// The caller must guarantee that there are no other strong owners and it is not
+            /// currently borrowed.
+            #[cfg(feature = "weak")]
+            pub unsafe fn unwrap_unchecked(self) -> T {
+                let this = ManuallyDrop::new(self);
+                let inner = this.inner();
+
+                let _weak: Weak<T> = Weak {
+                    ptr: this.ptr,
+                    _marker: PhantomData,
+                };
+
+                // SAFETY: guaranteed by caller to have unique strong ownership and
+                // not be borrowed. This moves out `T` without touching the
+                // allocation so outstanding weak refs remain valid.
+                unsafe { std::ptr::read(inner.data.get()) }
             }
         }
 
@@ -138,6 +176,7 @@ macro_rules! thin_cell {
             /// # Safety
             ///
             /// `self` must be the last owner and it must not be used after this call.
+            #[cfg(not(feature = "weak"))]
             unsafe fn drop_in_place(&mut self) {
                 drop(unsafe { Box::from_raw(self.inner_ptr() as *mut Inner<T>) })
             }
@@ -165,7 +204,7 @@ macro_rules! thin_cell {
                 }
             }
 
-            /// Returns the number of owners.
+            /// Returns the number of strong owners.
             pub fn count(&self) -> usize {
                 self.state().load().count()
             }
@@ -351,6 +390,45 @@ macro_rules! thin_cell {
             }
         }
 
+        #[cfg(feature = "weak")]
+        impl<T: ?Sized> ThinCell<T> {
+            /// Returns the number of strong references.
+            pub fn strong_count(&self) -> usize {
+                self.state().load().strong_count()
+            }
+
+            /// Returns the number of weak references.
+            pub fn weak_count(&self) -> usize {
+                self.state().load().weak_count()
+            }
+
+            /// Creates a new weak reference to this `ThinCell`.
+            ///
+            /// # Examples
+            ///
+            /// ```
+            /// # #[cfg(feature = "weak")]
+            /// # {
+            /// # use thin_cell::sync::ThinCell;
+            /// let cell = ThinCell::new(42);
+            /// let weak = cell.downgrade();
+            ///
+            /// assert_eq!(cell.strong_count(), 1);
+            /// assert_eq!(cell.weak_count(), 2);
+            ///
+            /// drop(cell);
+            /// assert!(weak.upgrade().is_none());
+            /// # }
+            /// ```
+            pub fn downgrade(&self) -> Weak<T> {
+                self.state().inc_weak();
+                Weak {
+                    ptr: self.ptr,
+                    _marker: PhantomData,
+                }
+            }
+        }
+
         impl<T, const N: usize> ThinCell<[T; N]> {
             /// Coerce an array [`ThinCell`] to a slice one.
             pub fn unsize_slice(self) -> ThinCell<[T]> {
@@ -454,6 +532,7 @@ macro_rules! thin_cell {
             }
         }
 
+        #[cfg(not(feature = "weak"))]
         impl<T: ?Sized> Drop for ThinCell<T> {
             fn drop(&mut self) {
                 let inner = self.inner();
@@ -467,6 +546,148 @@ macro_rules! thin_cell {
                 unsafe {
                     self.drop_in_place();
                 }
+            }
+        }
+
+        #[cfg(feature = "weak")]
+        impl<T: ?Sized> Drop for ThinCell<T> {
+            fn drop(&mut self) {
+                let inner = self.inner();
+                if !inner.state.dec() {
+                    // Not last strong owner, nothing to do
+                    return;
+                }
+
+                // Keep the strong side's collective weak ref alive as a real `Weak`
+                // guard so unwinding through `T::drop` still releases the allocation.
+                let _weak: Weak<T> = Weak {
+                    ptr: self.ptr,
+                    _marker: PhantomData,
+                };
+
+                // Drop the value in place.
+                // SAFETY: We are the last strong owner, so we have unique ownership.
+                unsafe {
+                    std::ptr::drop_in_place(inner.data.get());
+                }
+            }
+        }
+
+        #[cfg(feature = "weak")]
+        impl<T: ?Sized> Weak<T> {
+            /// Reconstructs the raw pointer to the inner allocation.
+            fn inner_ptr(&self) -> *const Inner<T> {
+                let ptr = self.ptr.as_ptr();
+
+                if ThinCell::<T>::IS_SIZED {
+                    // SIZED CASE: Cast pointer-to-pointer
+                    let ptr_ref = &ptr as *const *mut () as *const *const Inner<T>;
+                    unsafe { *ptr_ref }
+                } else {
+                    // UNSIZED CASE: Read metadata
+                    let metadata = unsafe { *(ptr as *const usize) };
+                    FatPtr { ptr, metadata }.into_ptr()
+                }
+            }
+
+            /// Returns a reference to the inner allocation.
+            fn inner(&self) -> &Inner<T> {
+                unsafe { &*self.inner_ptr() }
+            }
+
+            /// Returns a reference to the state cell.
+            fn state(&self) -> &State {
+                &self.inner().state
+            }
+
+            /// Attempts to upgrade the weak reference to a strong reference.
+            ///
+            /// Returns `Some(ThinCell)` if the value still exists, or `None` if it
+            /// has been dropped.
+            ///
+            /// # Examples
+            ///
+            /// ```
+            /// # #[cfg(feature = "weak")]
+            /// # {
+            /// # use thin_cell::sync::ThinCell;
+            /// let cell = ThinCell::new(42);
+            /// let weak = cell.downgrade();
+            ///
+            /// let strong = weak.upgrade().unwrap();
+            /// assert_eq!(*strong.borrow(), 42);
+            ///
+            /// drop(cell);
+            /// drop(strong);
+            /// assert!(weak.upgrade().is_none());
+            /// # }
+            /// ```
+            pub fn upgrade(&self) -> Option<ThinCell<T>> {
+                let state = self.state();
+
+                // Atomically try to increment strong count only if non-zero
+                if !state.try_inc() {
+                    return None;
+                }
+
+                Some(ThinCell {
+                    ptr: self.ptr,
+                    _marker: PhantomData,
+                })
+            }
+
+            /// Returns the number of strong references.
+            pub fn strong_count(&self) -> usize {
+                self.state().load().strong_count()
+            }
+
+            /// Returns the number of weak references.
+            pub fn weak_count(&self) -> usize {
+                self.state().load().weak_count()
+            }
+
+            /// Gets a raw pointer to the inner allocation.
+            ///
+            /// The pointer is valid only if the strong count is non-zero.
+            pub fn as_ptr(&self) -> *const () {
+                self.ptr.as_ptr()
+            }
+        }
+
+        #[cfg(feature = "weak")]
+        impl<T: ?Sized> Clone for Weak<T> {
+            fn clone(&self) -> Self {
+                self.state().inc_weak();
+                Weak {
+                    ptr: self.ptr,
+                    _marker: PhantomData,
+                }
+            }
+        }
+
+        #[cfg(feature = "weak")]
+        impl<T: ?Sized> Drop for Weak<T> {
+            fn drop(&mut self) {
+                let inner = self.inner();
+                if !inner.state.dec_weak() {
+                    // Not last weak ref, nothing to do
+                    return;
+                }
+
+                // Last weak ref and no strong refs - deallocate memory only
+                // The value T was already dropped when the last strong ref was dropped
+                // SAFETY: We are the last weak owner and no strong owners exist
+                unsafe {
+                    let layout = std::alloc::Layout::for_value(inner);
+                    std::alloc::dealloc(self.inner_ptr() as *mut u8, layout);
+                }
+            }
+        }
+
+        #[cfg(feature = "weak")]
+        impl<T: ?Sized> Debug for Weak<T> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "(Weak)")
             }
         }
 

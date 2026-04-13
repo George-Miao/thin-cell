@@ -10,3 +10,8 @@ crate::thin_cell! {
 
 unsafe impl<T: ?Sized + Send + Sync> Send for ThinCell<T> {}
 unsafe impl<T: ?Sized + Send + Sync> Sync for ThinCell<T> {}
+
+#[cfg(feature = "weak")]
+unsafe impl<T: ?Sized + Send + Sync> Send for Weak<T> {}
+#[cfg(feature = "weak")]
+unsafe impl<T: ?Sized + Send + Sync> Sync for Weak<T> {}
