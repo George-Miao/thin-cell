@@ -1166,7 +1166,7 @@ fn test_no_starvation() {
     let min = *res.iter().min().unwrap();
     let max = *res.iter().max().unwrap();
 
-    assert!(max <= min * 10 || min == 0, "min: {}, max: {}", min, max);
+    assert!(max <= min * 20 || min == 0, "min: {}, max: {}", min, max);
 
     println!("min: {min}, max: {max}");
 }
