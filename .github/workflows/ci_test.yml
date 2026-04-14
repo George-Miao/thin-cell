@@ -35,4 +35,4 @@ jobs:
         run: rustup toolchain install ${{ matrix.toolchain }}
       - name: Test on ${{ matrix.toolchain }}
         shell: bash
-        run: cargo +${{ matrix.toolchain }} test
+        run: cargo +${{ matrix.toolchain }} test --all-features

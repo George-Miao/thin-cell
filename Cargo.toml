@@ -12,5 +12,12 @@ keywords = ["rc", "refcell", "smart-pointer", "interior-mutability", "thin"]
 categories = ["data-structures", "memory-management"]
 readme = "README.md"
 
+[features]
+weak = []
+
 [dependencies]
 synchrony = "0.1.7"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

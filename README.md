@@ -42,6 +42,30 @@ Unlike `RefCell` which supports multiple immutable borrows OR one mutable borrow
 
 `try_borrow` is available for both versions, which returns `None` instead of panicking or blocking when already borrowed.
 
+## Weak References (feature `weak`)
+
+Enable the optional `weak` feature to get non-owning `Weak<T>` handles. A weak handle does not keep the value alive; the value is dropped when the last strong `ThinCell` is dropped, and the allocation is freed once the last `Weak` is dropped. Internally, the strong side holds one implicit weak reference like `Rc`/`Arc`. Use `ThinCell::downgrade` to create a `Weak<T>` and `Weak::upgrade` to try to regain a strong handle. Both `sync` and `unsync` versions expose `strong_count` and `weak_count` when the feature is on.
+
+```rust
+# #[cfg(feature = "weak")]
+# {
+use thin_cell::sync::ThinCell;
+
+let cell = ThinCell::new(String::from("hello"));
+let weak = cell.downgrade();
+
+assert_eq!(cell.strong_count(), 1);
+assert_eq!(cell.weak_count(), 2);
+
+let strong = weak.upgrade().unwrap();
+assert_eq!(strong.strong_count(), 2);
+
+drop(cell);
+drop(strong);
+assert!(weak.upgrade().is_none()); // value already dropped
+# }
+```
+
 ## Examples
 
 ### Basic Usage
